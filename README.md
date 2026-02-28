@@ -300,8 +300,6 @@ This project is licensed under the MIT License — see [LICENSE](LICENSE) for de
 
 <div align="center">
 
-**Built with 🧠 AI-assisted development using GitHub Copilot + Claude**
-
 *If this project helps you, consider giving it a ⭐!*
 
 </div>
