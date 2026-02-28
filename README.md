@@ -113,7 +113,6 @@ Built for **network engineers and support teams** who need quick, AI-assisted an
 | **Access Method** | SSH Tunnel via Azure CLI | Encrypted access, zero public web ports |
 | **Service Manager** | systemd | Auto-start, crash recovery |
 | **Session Storage** | JSON files on disk | Persistent analysis history |
-| **Development** | VS Code + GitHub Copilot (Claude) | AI-assisted development |
 
 ---
 
@@ -290,7 +289,6 @@ This project is licensed under the MIT License — see [LICENSE](LICENSE) for de
 - **[Ollama](https://ollama.com)** — Local LLM runtime that makes self-hosted AI accessible
 - **[Scapy](https://scapy.net)** — Powerful Python packet manipulation library
 - **[Flask](https://flask.palletsprojects.com)** — Lightweight Python web framework
-- **[GitHub Copilot](https://github.com/features/copilot)** — AI-assisted development used throughout this project
 
 ---
 
