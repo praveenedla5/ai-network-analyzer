@@ -192,18 +192,14 @@ Comprehensive guides for every aspect of the project:
 
 ## 📸 Screenshots
 
-> **Coming soon** — Add your own screenshots to the `assets/` folder and reference them here.
-
-<!-- Uncomment and update these when you have screenshots:
 ### Main Interface
-![Main Interface](assets/screenshot-main.png)
+![Main Interface](assets/main-ui.png)
 
-### PCAP Analysis
-![PCAP Analysis](assets/screenshot-pcap-analysis.png)
+### PCAP Analysis Results
+![PCAP Analysis](assets/pcap-analysis.png)
 
 ### Session History
-![Session History](assets/screenshot-session-history.png)
--->
+![Session History](assets/session-history.png)
 
 ---
 
