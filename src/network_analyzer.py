@@ -44,12 +44,21 @@ OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.1")
 UPLOAD_FOLDER = os.environ.get("UPLOAD_FOLDER", "/data/network-analyzer/uploads")
 SESSIONS_FOLDER = os.environ.get("SESSIONS_FOLDER", "/data/network-analyzer/sessions")
 PORT = int(os.environ.get("PORT", "8080"))
+# Maximum total upload size in bytes; 0 means unlimited (default).
+# Set MAX_UPLOAD_MB env var to a positive integer to impose a cap.
+_max_upload_mb = int(os.environ.get("MAX_UPLOAD_MB", "0"))
+MAX_CONTENT_LENGTH = _max_upload_mb * 1024 * 1024 if _max_upload_mb > 0 else None
+# Maximum number of characters of analysis JSON forwarded to the LLM in a
+# single request.  Large analyses are truncated and the model is informed.
+LLM_CONTEXT_CHAR_LIMIT = int(os.environ.get("LLM_CONTEXT_CHAR_LIMIT", "12000"))
 
 # ============================================================================
 # INITIALIZE
 # ============================================================================
 
 app = Flask(__name__)
+if MAX_CONTENT_LENGTH:
+    app.config['MAX_CONTENT_LENGTH'] = MAX_CONTENT_LENGTH
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(SESSIONS_FOLDER, exist_ok=True)
 
@@ -57,8 +66,16 @@ os.makedirs(SESSIONS_FOLDER, exist_ok=True)
 conversations = {}
 
 
-def save_session(conversation_id, file_name=None, analysis=None, messages=None):
-    """Persist session data to a JSON file on disk."""
+def save_session(conversation_id, file_name=None, analysis=None, messages=None,
+                 file_names=None):
+    """Persist session data to a JSON file on disk.
+
+    ``file_names`` is an optional list of file names uploaded in the most
+    recent batch.  When provided it is *appended* to the session's cumulative
+    file list rather than replacing it, so the full history is preserved.
+    ``file_name`` (singular) is kept for backwards-compatibility and is
+    treated the same as ``file_names=[file_name]``.
+    """
     session_path = os.path.join(SESSIONS_FOLDER, f"{conversation_id}.json")
     # Load existing or start fresh
     if os.path.exists(session_path):
@@ -70,14 +87,31 @@ def save_session(conversation_id, file_name=None, analysis=None, messages=None):
             "created": datetime.utcnow().isoformat() + "Z",
             "file_name": None,
             "file_type": None,
+            "file_names": [],
             "analysis": None,
             "messages": []
         }
+    # Ensure cumulative list field exists for older sessions
+    if "file_names" not in data:
+        data["file_names"] = [data["file_name"]] if data.get("file_name") else []
     data["updated"] = datetime.utcnow().isoformat() + "Z"
-    if file_name:
-        data["file_name"] = file_name
-        ext = file_name.rsplit('.', 1)[-1].lower() if '.' in file_name else ''
+
+    # Normalise new names into a list
+    new_names = []
+    if file_names:
+        new_names = list(file_names)
+    elif file_name:
+        new_names = [file_name]
+
+    if new_names:
+        # Update legacy singular fields using the first/last file for compat
+        last = new_names[-1]
+        data["file_name"] = last
+        ext = last.rsplit('.', 1)[-1].lower() if '.' in last else ''
         data["file_type"] = "pcap" if ext in ('pcap', 'cap') else "har" if ext == 'har' else ext
+        # Append all new names to cumulative list
+        data["file_names"].extend(new_names)
+
     if analysis is not None:
         data["analysis"] = analysis
     if messages is not None:
@@ -107,6 +141,7 @@ def list_sessions():
                 sessions.append({
                     "id": data.get("id", fname[:-5]),
                     "file_name": data.get("file_name"),
+                    "file_names": data.get("file_names", [data["file_name"]] if data.get("file_name") else []),
                     "file_type": data.get("file_type"),
                     "created": data.get("created"),
                     "updated": data.get("updated"),
@@ -496,6 +531,43 @@ def analyze_har_detailed(filepath: str) -> dict:
 
 
 # ============================================================================
+# LLM QUERY HELPERS
+# ============================================================================
+
+def _truncate_analysis(analysis_data: dict) -> str:
+    """Serialise analysis_data to JSON and truncate if needed.
+
+    Very large PCAP/HAR files produce huge analysis dicts that exceed the
+    model's context window.  We cap the serialised representation at
+    ``LLM_CONTEXT_CHAR_LIMIT`` characters and append a note so the model
+    knows the data was trimmed.
+    """
+    raw = json.dumps(analysis_data, indent=2)
+    if len(raw) <= LLM_CONTEXT_CHAR_LIMIT:
+        return raw
+    truncated = raw[:LLM_CONTEXT_CHAR_LIMIT]
+    # Close any open JSON structure gracefully so the block is valid-looking
+    truncated += "\n... [truncated – file is large; shown first "
+    truncated += f"{LLM_CONTEXT_CHAR_LIMIT} chars of {len(raw)} total]"
+    return truncated
+
+
+def _merge_analyses(analyses: list) -> dict:
+    """Merge a list of per-file analysis dicts into a single summary dict.
+
+    The merged structure keeps each file's data under its own key so the LLM
+    receives all relevant context in one call.
+    """
+    if len(analyses) == 1:
+        return analyses[0]
+    merged = {"files": {}, "file_count": len(analyses)}
+    for a in analyses:
+        name = a.get("file_name", f"file_{len(merged['files']) + 1}")
+        merged["files"][name] = a
+    return merged
+
+
+# ============================================================================
 # LLM QUERY
 # ============================================================================
 
@@ -509,10 +581,11 @@ def query_llm(prompt: str, analysis_data: dict = None, conversation_id: str = No
         history = conversations[conversation_id][-6:]
         messages.extend(history)
     
-    # Build context with analysis data
+    # Build context with analysis data (truncated if necessary)
     context = ""
     if analysis_data:
-        context = f"\n\n[ANALYSIS DATA]\n```json\n{json.dumps(analysis_data, indent=2)}\n```\n"
+        serialised = _truncate_analysis(analysis_data)
+        context = f"\n\n[ANALYSIS DATA]\n```json\n{serialised}\n```\n"
     
     user_content = prompt + context
     messages.append({"role": "user", "content": user_content})
@@ -1180,12 +1253,12 @@ HTML_TEMPLATE = """
             </div>
             
             <div class="input-area">
-                <input type="file" id="file-input" accept=".pcap,.cap,.har" style="display:none;" onchange="onFileSelected(this)">
+                <input type="file" id="file-input" accept=".pcap,.cap,.har" style="display:none;" multiple onchange="onFileSelected(this)">
                 <div class="upload-zone" id="upload-zone" onclick="document.getElementById('file-input').click()">
                     <div class="upload-icon">&#x1F4C1;</div>
                     <div class="upload-text">
                         <strong>Click to upload</strong> or drag & drop<br>
-                        PCAP, CAP, or HAR files
+                        PCAP, CAP, or HAR files &mdash; multiple files allowed
                     </div>
                 </div>
                 
@@ -1215,6 +1288,7 @@ HTML_TEMPLATE = """
     
     <script>
         let uploadedFile = null;
+        let uploadedFiles = [];  // supports multiple files
         let conversationId = 'session_' + Date.now();
         let isLoading = false;
         let lastAnalysis = null;
@@ -1284,6 +1358,7 @@ HTML_TEMPLATE = """
                 conversationId = data.id;
                 lastAnalysis = data.analysis;
                 uploadedFile = null;
+                uploadedFiles = [];
                 isLoading = false;
                 removeFile();
 
@@ -1358,6 +1433,7 @@ HTML_TEMPLATE = """
             // Generate new session id
             conversationId = 'session_' + Date.now();
             uploadedFile = null;
+            uploadedFiles = [];
             lastAnalysis = null;
             isLoading = false;
 
@@ -1380,8 +1456,8 @@ HTML_TEMPLATE = """
         }
 
         function onFileSelected(input) {
-            var file = input.files[0];
-            if (file) setFile(file);
+            var files = Array.from(input.files);
+            if (files.length > 0) setFiles(files);
         }
         
         // Drag and drop
@@ -1399,31 +1475,38 @@ HTML_TEMPLATE = """
         uploadZone.addEventListener('drop', function(e) {
             e.preventDefault();
             uploadZone.classList.remove('dragover');
-            var file = e.dataTransfer.files[0];
-            if (file) setFile(file);
+            var files = Array.from(e.dataTransfer.files);
+            if (files.length > 0) setFiles(files);
         });
         
-        function setFile(file) {
-            console.log('setFile called with:', file.name);
+        function setFiles(files) {
             const validExts = ['.pcap', '.cap', '.har'];
-            const ext = '.' + file.name.split('.').pop().toLowerCase();
-            console.log('Extension:', ext);
-            
-            if (!validExts.includes(ext)) {
-                alert('Please upload a PCAP, CAP, or HAR file');
+            const invalid = files.filter(f => !validExts.includes('.' + f.name.split('.').pop().toLowerCase()));
+            if (invalid.length > 0) {
+                alert('Unsupported file type(s): ' + invalid.map(f => f.name).join(', ') + '. Please upload PCAP, CAP, or HAR files only.');
                 return;
             }
-            
-            uploadedFile = file;
-            console.log('Setting file-name to:', file.name);
-            document.getElementById('file-name').textContent = file.name;
+
+            // Merge with any already-queued files (avoid duplicates by name+size)
+            const existingKeys = new Set(uploadedFiles.map(f => f.name + ':' + f.size));
+            files.forEach(f => { if (!existingKeys.has(f.name + ':' + f.size)) uploadedFiles.push(f); });
+            uploadedFile = uploadedFiles[0] || null;  // keep legacy compat
+
+            const label = uploadedFiles.length === 1
+                ? uploadedFiles[0].name
+                : uploadedFiles.length + ' files selected: ' + uploadedFiles.map(f => f.name).join(', ');
+            document.getElementById('file-name').textContent = label;
             document.getElementById('file-info').style.display = 'flex';
             document.getElementById('upload-zone').style.display = 'none';
-            console.log('File set successfully');
         }
+
+        // setFile is a convenience wrapper used by drag-and-drop and any other
+        // single-file callers; it delegates to the multi-file setFiles().
+        function setFile(file) { setFiles([file]); }
         
         function removeFile() {
             uploadedFile = null;
+            uploadedFiles = [];
             document.getElementById('file-info').style.display = 'none';
             document.getElementById('upload-zone').style.display = 'block';
             document.getElementById('file-input').value = '';
@@ -1442,10 +1525,12 @@ HTML_TEMPLATE = """
             const input = document.getElementById('message-input');
             let message = input.value.trim();
             
-            if (!message && !uploadedFile) return;
+            if (!message && uploadedFiles.length === 0) return;
             
-            if (!message && uploadedFile) {
-                message = "Analyze this file and identify any issues or anomalies.";
+            if (!message && uploadedFiles.length > 0) {
+                message = uploadedFiles.length === 1
+                    ? "Analyze this file and identify any issues or anomalies."
+                    : `Analyze these ${uploadedFiles.length} files and identify any issues or anomalies.`;
             }
             
             isLoading = true;
@@ -1467,9 +1552,10 @@ HTML_TEMPLATE = """
                 formData.append('message', message);
                 formData.append('conversation_id', conversationId);
                 
-                if (uploadedFile) {
-                    formData.append('file', uploadedFile);
+                if (uploadedFiles.length > 0) {
+                    uploadedFiles.forEach(f => formData.append('file', f));
                     uploadedFile = null;
+                    uploadedFiles = [];
                     removeFile();
                 }
                 
@@ -1537,7 +1623,32 @@ HTML_TEMPLATE = """
             const panel = document.getElementById('analysis-content');
             let html = '';
             
-            if (analysis.total_packets !== undefined) {
+            // Multi-file merged analysis
+            if (analysis.files && analysis.file_count !== undefined) {
+                html = `<div class="analysis-card"><h4>Files Analyzed</h4><div class="value">${analysis.file_count}</div></div>`;
+                Object.entries(analysis.files).forEach(([name, fa]) => {
+                    html += `<div class="analysis-card"><h4 style="word-break:break-all;">${escHtml(name)}</h4>`;
+                    if (fa.total_packets !== undefined) {
+                        html += `<div class="stat-grid">
+                            <div class="stat-item"><label>Packets</label><span>${fa.total_packets.toLocaleString()}</span></div>
+                            <div class="stat-item"><label>Duration</label><span>${fa.capture_duration_sec}s</span></div>
+                            <div class="stat-item"><label>TCP</label><span>${fa.protocols?.tcp || 0}</span></div>
+                            <div class="stat-item"><label>RST</label><span style="color:${fa.tcp_flags?.rst > 10 ? 'var(--error)' : 'inherit'}">${fa.tcp_flags?.rst || 0}</span></div>
+                        </div>`;
+                    } else if (fa.total_requests !== undefined) {
+                        html += `<div class="stat-grid">
+                            <div class="stat-item"><label>Requests</label><span>${fa.total_requests}</span></div>
+                            <div class="stat-item"><label>Avg ms</label><span>${fa.timing?.avg_time_ms || 0}</span></div>
+                            <div class="stat-item"><label>4xx</label><span style="color:${fa.errors?.['4xx_count'] > 0 ? 'var(--warning)' : 'inherit'}">${fa.errors?.['4xx_count'] || 0}</span></div>
+                            <div class="stat-item"><label>5xx</label><span style="color:${fa.errors?.['5xx_count'] > 0 ? 'var(--error)' : 'inherit'}">${fa.errors?.['5xx_count'] || 0}</span></div>
+                        </div>`;
+                    }
+                    if (fa.issues_detected && fa.issues_detected.length > 0) {
+                        fa.issues_detected.forEach(issue => { html += `<div class="issue-item warning" style="margin-top:4px">${issue}</div>`; });
+                    }
+                    html += '</div>';
+                });
+            } else if (analysis.total_packets !== undefined) {
                 // PCAP Analysis
                 html = `
                     <div class="analysis-card">
@@ -1662,45 +1773,65 @@ def analyze():
     try:
         message = request.form.get("message", "")
         conversation_id = request.form.get("conversation_id", "default")
-        file = request.files.get("file")
-        
-        analysis = None
-        
-        # Handle file upload
-        if file and file.filename:
+
+        # Accept files posted under either the key "file" (browser UI) or
+        # "files" (API / curl clients using the plural form).
+        uploaded_files = request.files.getlist("file") + request.files.getlist("files")
+        # Filter out empty file entries (browser may send blank entries)
+        uploaded_files = [f for f in uploaded_files if f and f.filename]
+
+        analyses = []
+        processed_names = []
+
+        for file in uploaded_files:
             filename = file.filename.lower()
             safe_name = f"{hashlib.md5(filename.encode()).hexdigest()}_{Path(filename).name}"
             filepath = os.path.join(UPLOAD_FOLDER, safe_name)
             file.save(filepath)
-            
+
             if filename.endswith(('.pcap', '.cap')):
-                analysis = analyze_pcap_detailed(filepath)
+                file_analysis = analyze_pcap_detailed(filepath)
             elif filename.endswith('.har'):
-                analysis = analyze_har_detailed(filepath)
+                file_analysis = analyze_har_detailed(filepath)
             else:
-                return jsonify({"error": "Unsupported file type. Use PCAP, CAP, or HAR."}), 400
-            
-            if analysis and "error" in analysis:
-                return jsonify({"error": analysis["error"]}), 400
-            
-            # Persist file name and analysis to session
-            save_session(conversation_id, file_name=file.filename, analysis=analysis)
-        
-        # If no message but file uploaded, generate default prompt
+                return jsonify({"error": f"Unsupported file type '{Path(file.filename).suffix}'. Use PCAP, CAP, or HAR."}), 400
+
+            if file_analysis and "error" in file_analysis:
+                return jsonify({"error": file_analysis["error"]}), 400
+
+            analyses.append(file_analysis)
+            processed_names.append(file.filename)
+
+        # Merge all per-file analyses into one structure for the LLM
+        analysis = _merge_analyses(analyses) if analyses else None
+
+        if analysis:
+            # Persist cumulative file names and latest analysis to session
+            save_session(conversation_id, file_names=processed_names, analysis=analysis)
+
+        # If no message but files uploaded, generate default prompt
         if not message and analysis:
-            message = "Analyze this capture and identify any issues, anomalies, or troubleshooting insights."
-        
+            if len(processed_names) == 1:
+                message = "Analyze this capture and identify any issues, anomalies, or troubleshooting insights."
+            else:
+                message = (
+                    f"Analyze these {len(processed_names)} captures and identify any issues, "
+                    "anomalies, or troubleshooting insights."
+                )
+
         if not message:
             return jsonify({"error": "Please provide a message or upload a file."}), 400
-        
+
         # Query LLM
         response = query_llm(message, analysis, conversation_id)
-        
+
         return jsonify({
             "response": response,
-            "analysis": analysis
+            "analysis": analysis,
+            "file_count": len(processed_names),
+            "file_names": processed_names
         })
-        
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1750,6 +1881,8 @@ if __name__ == "__main__":
     print(f"PCAP Analysis: {'✓ Available' if SCAPY_AVAILABLE else '✗ Not Available (pip install scapy)'}")
     print(f"HAR Analysis:  {'✓ Available' if HARALYZER_AVAILABLE else '✗ Not Available (pip install haralyzer)'}")
     print(f"LLM Model:     {OLLAMA_MODEL}")
+    print(f"Upload Limit:  {'Unlimited' if not MAX_CONTENT_LENGTH else str(_max_upload_mb) + ' MB'}")
+    print(f"LLM Context:   {LLM_CONTEXT_CHAR_LIMIT} chars max per analysis")
     print(f"Server:        http://0.0.0.0:{PORT}")
     print(f"{'='*60}\n")
     
